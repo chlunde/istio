@@ -1,0 +1,19 @@
+apiVersion: release-notes/v2
+kind: bug-fix
+area: traffic-management
+releaseNotes:
+  - |
+    **Fixed** an issue where a terminating istiod stopped watching Kubernetes and stopped pushing configuration
+    as soon as it received SIGTERM. Proxies connected over the secure xDS port were disconnected at the same moment,
+    and proxies connected over the plaintext port kept an open stream that received no updates for up to
+    `--shutdownDuration`. Changes made while those proxies were reconnecting, for example the removal of endpoints
+    of pods drained together with istiod, were not delivered until they had reconnected to another istiod. istiod
+    now keeps its informers and push queue running while its gRPC servers stop gracefully (up to
+    `--shutdownDuration`, 10s by default), and disconnects the remaining proxies afterwards.
+upgradeNotes:
+  - title: istiod keeps serving connected proxies during shutdown
+    content: |
+      On SIGTERM, istiod previously closed all xDS connections on the secure port (15012) immediately. It now keeps
+      them open and keeps pushing updates for up to `--shutdownDuration` (10s by default) before closing them, so
+      istiod pods take up to that much longer to terminate. Make sure `terminationGracePeriodSeconds` leaves room
+      for it (the default of 30s does).

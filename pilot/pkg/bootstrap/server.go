@@ -475,8 +475,25 @@ func (s *Server) Start(stop <-chan struct{}) error {
 		log.Warn("Server is starting with unsafe features enabled")
 	}
 
+	// Components (Kubernetes informers, the xDS push queue, ...) run until componentStop is closed,
+	// not until stop is closed. On shutdown, waitForShutdown keeps them running until the gRPC
+	// servers have stopped, so proxies that are still connected during the graceful shutdown keep
+	// receiving updates instead of holding an open stream that receives no pushes.
+	componentStop := make(chan struct{})
+	shutdownHandled := false
+	defer func() {
+		if !shutdownHandled {
+			// Start failed before shutdown handling was set up; keep the previous behavior of
+			// stopping the components when stop is closed.
+			go func() {
+				<-stop
+				close(componentStop)
+			}()
+		}
+	}()
+
 	// Now start all of the components.
-	if err := s.server.Start(stop); err != nil {
+	if err := s.server.Start(componentStop); err != nil {
 		return err
 	}
 	if !s.waitForCacheSync(stop) {
@@ -530,7 +547,8 @@ func (s *Server) Start(stop <-chan struct{}) error {
 		s.httpsAddr = httpsListener.Addr().String()
 	}
 
-	s.waitForShutdown(stop)
+	shutdownHandled = true
+	s.waitForShutdown(stop, componentStop)
 
 	return nil
 }
@@ -708,16 +726,17 @@ func (s *Server) initDiscoveryService() {
 	})
 }
 
-// Wait for the stop, and do cleanups
-func (s *Server) waitForShutdown(stop <-chan struct{}) {
+// Wait for the stop, and do cleanups.
+//
+// The gRPC servers are stopped first, while the components (informers, push queue, config
+// watchers) are still running. Graceful stop does not end the long-lived xDS streams, so it
+// typically waits for the full shutdownDuration; during that time connected proxies must keep
+// receiving pushes, otherwise they miss every change (for example endpoints of pods that are
+// terminated in the same node drain) until they have reconnected to another istiod.
+// componentStop and internalStop are closed only after the gRPC servers have stopped.
+func (s *Server) waitForShutdown(stop <-chan struct{}, componentStop chan struct{}) {
 	go func() {
 		<-stop
-		close(s.internalStop)
-		_ = s.fileWatcher.Close()
-
-		if s.cacertsWatcher != nil {
-			_ = s.cacertsWatcher.Close()
-		}
 		// Stop gRPC services.  If gRPC services fail to stop in the shutdown duration,
 		// force stop them. This does not happen normally.
 		stopped := make(chan struct{})
@@ -750,6 +769,14 @@ func (s *Server) waitForShutdown(stop <-chan struct{}) {
 			}
 		case <-stopped:
 			t.Stop()
+		}
+
+		// No proxy is connected anymore; stop watching for changes.
+		close(componentStop)
+		close(s.internalStop)
+		_ = s.fileWatcher.Close()
+		if s.cacertsWatcher != nil {
+			_ = s.cacertsWatcher.Close()
 		}
 
 		// Stop HTTP services.
